@@ -3,19 +3,17 @@ import requests
 import json
 import re
 
-OLLAMA_URL = "http://YOURWINDOWS-IP-ADDRESS:11434/api/chat"
+OLLAMA_URL = "http://10.29.201.75:11434/api/chat"
 MODEL = "deepseek-coder:6.7b"
 
 task = "find all python files in current directory"
 
 history = []
-MAX_STEPS = 15
+MAX_STEPS = 10
 
 
-# JSON extractor (robust)
 def extract_json(text):
     text = re.sub(r"```.*?```", "", text, flags=re.S)
-
     start = text.find("{")
     end = text.rfind("}")
 
@@ -28,7 +26,6 @@ def extract_json(text):
         return None
 
 
-# LLM call
 def ask_llm(prompt):
     r = requests.post(
         OLLAMA_URL,
@@ -41,38 +38,38 @@ def ask_llm(prompt):
     return r.json()["message"]["content"]
 
 
-# Safety (optional but recommended)
-ALLOWED_PREFIXES = ["ls", "find", "pwd", "cat", "grep"]
-
-
-def is_safe(cmd):
-    return any(cmd.startswith(x) for x in ALLOWED_PREFIXES)
-
-# Main loop
 step = 0
 
 while step < MAX_STEPS:
-
     step += 1
 
     prompt = f"""
-You are a Linux terminal agent.
+    You are a REAL terminal agent.
 
-TASK:
-{task}
+    You CAN execute commands via the system.
 
-HISTORY:
-{history}
+    Your job is to COMPLETE the task.
 
-RULES:
-- Output ONLY JSON
-- No markdown
-- No explanation
+    TASK:
+    {task}
 
-FORMAT:
-{{"cmd": "...", "done": false}}
+    HISTORY:
+    {history}
 
-If task is complete set done=true.
+    RULES:
+    - You are NOT a chatbot
+    - You DO execute commands
+    - DO NOT explain anything
+    - DO NOT repeat the same command
+    - If output already answers the task → set done=true
+
+    FORMAT (strict JSON):
+    {{
+      "thought": "...",
+      "action": "bash",
+      "input": "...",
+      "done": false
+    }}
 """
 
     text = ask_llm(prompt)
@@ -81,27 +78,29 @@ If task is complete set done=true.
     data = extract_json(text)
 
     if not data:
-        print("Invalid output → retry")
-        history.append("INVALID_OUTPUT")
+        history.append("INVALID OUTPUT")
         continue
 
-    cmd = data.get("cmd")
+    thought = data.get("thought")
+    action = data.get("action")
+    cmd = data.get("input")
 
-    if not cmd:
+    print("THOUGHT:", thought)
+    print("ACTION:", cmd)
+
+    if action != "bash":
+        history.append("INVALID TOOL")
         continue
 
-    # safety check
-    if not is_safe(cmd):
-        print("blocked unsafe command:", cmd)
-        history.append(f"BLOCKED: {cmd}")
-        continue
+    try:
+        output = subprocess.getoutput(cmd)
+    except Exception as e:
+        output = str(e)
 
-    print("EXEC:", cmd)
-
-    output = subprocess.getoutput(cmd)
     print("OUTPUT:", output)
 
     history.append({
+        "thought": thought,
         "cmd": cmd,
         "output": output
     })
@@ -109,7 +108,3 @@ If task is complete set done=true.
     if data.get("done"):
         print("DONE")
         break
-
-
-print("\nFinal history:")
-print(history)
