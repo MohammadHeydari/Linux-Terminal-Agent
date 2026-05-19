@@ -5,8 +5,8 @@ import uuid
 import time
 import re
 
-# YOUR IP
-OLLAMA_URL = "http://YOUR IP:11434/api/chat"
+# YOUR-IP
+OLLAMA_URL = "http://YOUR-IP:11434/api/chat"
 MODEL_NAME = "deepseek-coder:6.7b"
 
 MAX_OUTPUT_CHARS = 2000

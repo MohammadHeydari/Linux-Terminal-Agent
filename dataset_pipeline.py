@@ -3,255 +3,255 @@ import requests
 import json
 import uuid
 import time
+import re
 
-# YOUR IP
-OLLAMA_URL = "http://YOUR IP:11434/api/chat"
+# your ip address
+OLLAMA_URL = "http://YOUR-IP:11434/api/chat"
 MODEL_NAME = "deepseek-coder:6.7b"
 
-DATASET_FILE = "dataset.jsonl"
-SAFE_ROOT = "/root/projects/"
+MAX_STEPS = 6
+MAX_RETRIES = 3
+MAX_OUTPUT = 1200
+TIMEOUT = 3
 
-# -----------------------------
-# SAFETY CONFIG
-# -----------------------------
-
-ALLOWED_COMMANDS = ["ls", "find", "wc", "pwd", "du", "cat"]
-BLOCKED_PATTERNS = ["find /", "rm -rf", "mkfs", "dd if=", ":(){:|:&};:"]
-
-MAX_CMD_LEN = 80
-MAX_OUTPUT_LINES = 30
+SAFE_PREFIX = ("ls", "pwd", "find", "wc", "du", "grep", "cat", "echo", "head", "tail", "sort")
 
 
-# -----------------------------
-# TASKS (SAFE)
-# -----------------------------
-
-def generate_tasks():
-    return [
-        "find all python files in current directory",
-        "count lines in agent.py",
-        "show current directory",
-        "list files sorted by size in current directory",
-        "print working directory"
-    ]
-
-
-# -----------------------------
-# JSON PARSER (ROBUST)
-# -----------------------------
-
+# ----------------------------
+# JSON PARSER
+# ----------------------------
 def extract_json(text):
     try:
-        text = text.replace("```json", "").replace("```bash", "").replace("```", "")
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        return json.loads(text[start:end])
+        m = re.search(r"\{.*\}", text, re.S)
+        if not m:
+            return None
+        return json.loads(m.group())
     except:
         return None
 
 
-# -----------------------------
-# SAFETY CHECK
-# -----------------------------
-
+# ----------------------------
+# SAFETY
+# ----------------------------
 def is_safe(cmd):
-    if not cmd:
-        return False
-
-    if len(cmd) > MAX_CMD_LEN:
-        return False
-
-    if any(b in cmd for b in BLOCKED_PATTERNS):
-        return False
-
-    return any(cmd.startswith(a) for a in ALLOWED_COMMANDS)
+    cmd = cmd.strip()
+    return cmd.startswith(SAFE_PREFIX)
 
 
-# -----------------------------
-# SAFE EXECUTION
-# -----------------------------
-
-def run_cmd(cmd):
+# ----------------------------
+# EXECUTOR
+# ----------------------------
+def run(cmd):
     try:
-        cmd = cmd.replace("find /", f"find {SAFE_ROOT}")
-
-        result = subprocess.getoutput(f"timeout 3s {cmd}")
-
-        # truncate output
-        lines = result.split("\n")
-        return "\n".join(lines[:MAX_OUTPUT_LINES])
-
+        p = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT
+        )
+        out = (p.stdout + p.stderr).strip()
+        return out[:MAX_OUTPUT]
     except Exception as e:
         return f"ERROR: {str(e)}"
 
 
-# -----------------------------
-# AGENT LOOP
-# -----------------------------
+# ----------------------------
+# VERIFIER (🔥 CORE OF LEVEL 3)
+# ----------------------------
+def verify(task, traj):
+    if not traj:
+        return "fail"
 
-def run_agent(task, max_steps=4):
+    last = traj[-1]["output"].lower()
+    cmds = [t["cmd"] for t in traj]
 
-    history = []
-    trajectory = []
+    # ---- RULES ----
 
-    last_cmd = None
-    repeat_count = 0
+    if "current directory" in task:
+        return "success" if "/" in last else "fail"
 
-    for step in range(max_steps):
+    if "list files" in task:
+        return "success" if any("ls" in c for c in cmds) else "fail"
 
-        prompt = f"""
-        You are a STRICT Linux terminal agent for dataset generation.
+    if "python files" in task:
+        return "success" if ".py" in last else "partial"
 
-        CRITICAL RULES:
-        - You MUST use SIMPLE commands only
-        - Avoid pipes unless absolutely necessary
-        - NEVER use complex pipelines like grep, awk, sort unless asked
-        - NEVER repeat same command twice
-        - NEVER scan large directories recursively (/ or ~)
-        - ONLY work inside current directory
+    if "count lines" in task:
+        return "success" if "wc -l" in " ".join(cmds) else "fail"
 
-        ALLOWED COMMANDS:
-        - ls
-        - pwd
-        - wc -l filename
-        - find . -name "*.py"
-        - du -sh *
+    if "disk usage" in task:
+        return "success" if "du" in " ".join(cmds) else "fail"
 
-        Task:
-        {task}
+    if "first 5 lines" in task:
+        return "success" if "head" in " ".join(cmds) else "fail"
 
-        History (last 3 steps only):
-        {json.dumps(history[-3:], indent=2)}
+    return "partial"
 
-        Return ONLY valid JSON:
-        {{
-          "thought": "...",
-          "cmd": "...",
-          "done": false
-        }}
+
+# ----------------------------
+# REWARD FUNCTION
+# ----------------------------
+def reward(label, traj):
+    base = {
+        "success": 1.0,
+        "partial": 0.5,
+        "fail": 0.0
+    }[label]
+
+    penalty = 0.05 * len(traj)
+
+    return max(base - penalty, 0)
+
+
+# ----------------------------
+# LLM CALL
+# ----------------------------
+def ask_llm(task, history, error=None):
+    prompt = f"""
+You are a Linux agent.
+
+RULES:
+- Return ONLY JSON
+- One command only
+- Must solve task minimally
+- No explanation
+
+TASK: {task}
+
+ERROR: {error}
+
+HISTORY:
+{json.dumps(history[-4:], indent=2)}
+
+FORMAT:
+{{
+  "thought": "short reasoning",
+  "cmd": "bash command",
+  "done": false
+}}
 """
 
-        try:
-            response = requests.post(
-                OLLAMA_URL,
-                json={
-                    "model": MODEL_NAME,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": False
-                },
-                timeout=40
-            )
+    try:
+        r = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": MODEL_NAME,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False
+            },
+            timeout=20
+        )
+        return r.json()["message"]["content"]
+    except:
+        return None
 
-            text = response.json()["message"]["content"]
-            print("\nMODEL:", text)
 
-        except Exception as e:
-            print("❌ API ERROR:", e)
+# ----------------------------
+# LOOP DETECT
+# ----------------------------
+def is_loop(history, cmd):
+    return cmd in [h["cmd"] for h in history[-3:]]
+
+
+# ----------------------------
+# AGENT
+# ----------------------------
+def run_agent(task):
+    history = []
+    error = None
+
+    for _ in range(MAX_STEPS):
+
+        for _ in range(MAX_RETRIES):
+            raw = ask_llm(task, history, error)
+            data = extract_json(raw or "")
+
+            if not data:
+                error = "json_fail"
+                continue
+
+            cmd = data.get("cmd", "").strip()
+
+            if not cmd:
+                error = "empty_cmd"
+                continue
+
+            if not is_safe(cmd):
+                error = "unsafe"
+                continue
+
+            if is_loop(history, cmd):
+                error = "loop"
+                continue
+
             break
-
-        data = extract_json(text)
-
-        if not data:
-            print("❌ JSON PARSE FAILED")
-            break
-
-        cmd = data.get("cmd")
-
-        if not cmd:
-            break
-
-        # -----------------------------
-        # LOOP DETECTION
-        # -----------------------------
-
-        if cmd == last_cmd:
-            repeat_count += 1
         else:
-            repeat_count = 0
+            return history, "fail"
 
-        if repeat_count >= 2:
-            print("🛑 LOOP DETECTED")
-            return trajectory, False
-
-        last_cmd = cmd
-
-        # -----------------------------
-        # SAFETY CHECK
-        # -----------------------------
-
-        if not is_safe(cmd):
-            print("❌ UNSAFE COMMAND BLOCKED:", cmd)
-            return trajectory, False
-
-        print("EXEC:", cmd)
-
-        output = run_cmd(cmd)
-        print("OUTPUT:", output)
-
-        trajectory.append({
-            "thought": data.get("thought", ""),
-            "cmd": cmd,
-            "output": output
-        })
+        output = run(cmd)
 
         history.append({
             "cmd": cmd,
             "output": output
         })
 
-        # -----------------------------
-        # DONE CHECK
-        # -----------------------------
+        if data.get("done"):
+            break
 
-        if data.get("done") is True:
-            if "ERROR" in output or "No such file" in output:
-                return trajectory, False
+        error = None
 
-            if len(trajectory) == 0:
-                return trajectory, False
-
-            return trajectory, True
-
-    return trajectory, False
+    label = verify(task, history)
+    return history, label
 
 
-# -----------------------------
-# SAVE DATASET (ONLY GOOD DATA)
-# -----------------------------
-
-def save_sample(task, trajectory, success):
-
-    if not success:
-        return
-
+# ----------------------------
+# DATASET SAVE (RL-ready)
+# ----------------------------
+def save(task, traj, label):
     sample = {
         "id": str(uuid.uuid4()),
         "task": task,
-        "trajectory": trajectory,
-        "success": True,
-        "timestamp": time.time()
+        "trajectory": traj,
+        "label": label,
+        "reward": reward(label, traj)
     }
 
-    with open(DATASET_FILE, "a") as f:
+    with open("dataset_v3.jsonl", "a") as f:
         f.write(json.dumps(sample) + "\n")
 
 
-# -----------------------------
+# ----------------------------
+# TASKS
+# ----------------------------
+def tasks():
+    return [
+        "show current directory",
+        "list files in current directory",
+        "find python files",
+        "count lines in agent.py",
+        "show disk usage",
+        "print first 5 lines of agent.py"
+    ]
+
+
+# ----------------------------
 # MAIN
-# -----------------------------
-
+# ----------------------------
 def main():
-    tasks = generate_tasks()
+    print("LEVEL 3 DATASET PIPELINE")
 
-    for task in tasks:
-        print("\n" + "=" * 50)
-        print("TASK:", task)
+    for t in tasks():
+        print("\n" + "=" * 40)
+        print("TASK:", t)
 
-        trajectory, success = run_agent(task)
+        traj, label = run_agent(t)
 
-        save_sample(task, trajectory, success)
+        print("LABEL:", label)
 
-        print("SAVED | success:", success)
+        save(t, traj, label)
+
+        time.sleep(0.5)
 
 
 if __name__ == "__main__":
