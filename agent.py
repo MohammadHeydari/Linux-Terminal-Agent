@@ -1,110 +1,138 @@
 import subprocess
 import requests
 import json
+import uuid
+import time
 import re
 
-OLLAMA_URL = "http://YOUR-WINDWOS-IP-ADDRESS:11434/api/chat"
-MODEL = "deepseek-coder:6.7b"
+# YOUR IP
+OLLAMA_URL = "http://YOUR IP:11434/api/chat"
+MODEL_NAME = "deepseek-coder:6.7b"
 
-task = "find all python files in current directory"
+MAX_OUTPUT_CHARS = 2000
+MAX_CMD_RUNTIME = 5
 
-history = []
-MAX_STEPS = 10
+ALLOWED_COMMANDS = [
+    "ls", "pwd", "find", "wc", "du", "grep", "cat", "echo", "head", "tail", "sort"
+]
 
 
-def extract_json(text):
-    text = re.sub(r"```.*?```", "", text, flags=re.S)
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start == -1 or end == -1:
-        return None
-
+def safe_parse(text):
     try:
-        return json.loads(text[start:end+1])
+        match = re.search(r"\{.*\}", text, re.S)
+        if not match:
+            return None
+        return json.loads(match.group())
     except:
         return None
 
 
-def ask_llm(prompt):
+def is_safe(cmd: str):
+    return any(cmd.strip().startswith(c) for c in ALLOWED_COMMANDS)
+
+
+def run_cmd(cmd: str):
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=MAX_CMD_RUNTIME
+        )
+        output = result.stdout + result.stderr
+        return output[:MAX_OUTPUT_CHARS]
+    except Exception as e:
+        return str(e)
+
+
+def ask_llm(task, history):
+    prompt = f"""
+You are a safe Linux terminal agent.
+
+RULES:
+- Return ONLY valid JSON
+- Never explain
+- Choose ONE bash command
+- Prefer safe commands (ls, find, pwd, wc, du, grep)
+- Avoid system-wide scans like find / or cat huge files
+- If task is done, set done=true
+
+TASK: {task}
+
+HISTORY:
+{json.dumps(history[-5:], indent=2)}
+
+FORMAT:
+{{
+  "thought": "...",
+  "cmd": "...",
+  "done": false
+}}
+"""
+
     r = requests.post(
         OLLAMA_URL,
         json={
-            "model": MODEL,
+            "model": MODEL_NAME,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False
-        }
+        },
+        timeout=30
     )
+
     return r.json()["message"]["content"]
 
 
-step = 0
+def run_agent(task, max_steps=6):
+    history = []
+    seen_cmds = set()
 
-while step < MAX_STEPS:
-    step += 1
+    for step in range(max_steps):
 
-    prompt = f"""
-    You are a REAL terminal agent.
+        text = ask_llm(task, history)
+        data = safe_parse(text)
 
-    You CAN execute commands via the system.
+        if not data:
+            print("❌ JSON FAIL → retrying")
+            continue
 
-    Your job is to COMPLETE the task.
+        cmd = data.get("cmd")
 
-    TASK:
-    {task}
+        if not cmd:
+            continue
 
-    HISTORY:
-    {history}
+        if cmd in seen_cmds:
+            print("🛑 LOOP DETECTED")
+            break
 
-    RULES:
-    - You are NOT a chatbot
-    - You DO execute commands
-    - DO NOT explain anything
-    - DO NOT repeat the same command
-    - If output already answers the task → set done=true
+        if not is_safe(cmd):
+            print("⛔ BLOCKED COMMAND:", cmd)
+            continue
 
-    FORMAT (strict JSON):
-    {{
-      "thought": "...",
-      "action": "bash",
-      "input": "...",
-      "done": false
-    }}
-"""
+        seen_cmds.add(cmd)
 
-    text = ask_llm(prompt)
-    print("\nMODEL:", text)
+        print("\nMODEL:", data)
+        print("EXEC:", cmd)
 
-    data = extract_json(text)
+        output = run_cmd(cmd)
+        print("OUTPUT:", output)
 
-    if not data:
-        history.append("INVALID OUTPUT")
-        continue
+        history.append({
+            "cmd": cmd,
+            "output": output
+        })
 
-    thought = data.get("thought")
-    action = data.get("action")
-    cmd = data.get("input")
+        if data.get("done"):
+            break
 
-    print("THOUGHT:", thought)
-    print("ACTION:", cmd)
+    return history
 
-    if action != "bash":
-        history.append("INVALID TOOL")
-        continue
+if __name__ == "__main__":
+    print("AGENT STARTED")
 
-    try:
-        output = subprocess.getoutput(cmd)
-    except Exception as e:
-        output = str(e)
+    task = "show current directory"
+    result = run_agent(task)
 
-    print("OUTPUT:", output)
-
-    history.append({
-        "thought": thought,
-        "cmd": cmd,
-        "output": output
-    })
-
-    if data.get("done"):
-        print("DONE")
-        break
+    print("\nFINAL RESULT:")
+    print(result)
