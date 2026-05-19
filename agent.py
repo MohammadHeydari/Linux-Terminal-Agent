@@ -3,7 +3,7 @@ import requests
 import json
 import re
 
-OLLAMA_URL = "http://10.29.201.75:11434/api/chat"
+OLLAMA_URL = "http://YOUR-WINDWOS-IP-ADDRESS:11434/api/chat"
 MODEL = "deepseek-coder:6.7b"
 
 task = "find all python files in current directory"
